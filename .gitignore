@@ -1,0 +1,7 @@
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
+.env
+bot-out.log
+bot-err.log
+data/

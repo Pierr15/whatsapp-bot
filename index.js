@@ -1,0 +1,517 @@
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+const QRCode  = require('qrcode');
+const sharp   = require('sharp');
+const http    = require('http');
+const { createCanvas } = require('@napi-rs/canvas');
+
+// ── Global error guard ───────────────────────────────────────────────────────
+// Tanpa ini, error async dari dalam whatsapp-web.js/puppeteer (mis. saat inject
+// di tengah navigasi) menjadi unhandled rejection dan Node 22 langsung
+// mematikan proses — bot "berhenti" diam-diam setelah autentikasi.
+process.on('uncaughtException', (err) => {
+    console.error('💥 Uncaught exception:', err.stack || err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('💥 Unhandled rejection:', (reason && reason.stack) || reason);
+});
+
+// ── Default stiker info & parser perintah (dipisah ke src/ pada Stage 1) ───────
+const { DEFAULT_STICKER_AUTHOR } = require('./src/config/defaults');
+const { parseCommand } = require('./src/commands/parse');
+
+// ── QR server state ───────────────────────────────────────────────────────────
+let latestQR = null;
+
+// ── HTTP server — buka http://localhost:3000 untuk scan QR ────────────────────
+const server = http.createServer(async (req, res) => {
+    if (req.url !== '/') { res.writeHead(404); res.end(); return; }
+
+    if (!latestQR) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta http-equiv="refresh" content="3">
+                <title>WhatsApp Bot — QR</title>
+                <style>
+                    body { font-family: Arial, sans-serif; display: flex; flex-direction: column;
+                           align-items: center; justify-content: center; height: 100vh;
+                           margin: 0; background: #f0f2f5; }
+                    .box { background: white; border-radius: 16px; padding: 40px;
+                           box-shadow: 0 4px 20px rgba(0,0,0,0.1); text-align: center; }
+                    h2 { color: #128C7E; margin-bottom: 8px; }
+                    p  { color: #666; }
+                    .spinner { margin: 20px auto; width: 48px; height: 48px;
+                               border: 5px solid #ddd; border-top-color: #128C7E;
+                               border-radius: 50%; animation: spin 0.8s linear infinite; }
+                    @keyframes spin { to { transform: rotate(360deg); } }
+                </style>
+            </head>
+            <body>
+                <div class="box">
+                    <h2>🤖 WhatsApp Stiker Bot</h2>
+                    <p>Menunggu QR Code dari WhatsApp...</p>
+                    <div class="spinner"></div>
+                    <p><small>Halaman ini refresh otomatis setiap 3 detik</small></p>
+                </div>
+            </body>
+            </html>
+        `);
+        return;
+    }
+
+    // Generate QR sebagai gambar PNG (data URL)
+    const qrImage = await QRCode.toDataURL(latestQR, { width: 300, margin: 2 });
+
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <meta http-equiv="refresh" content="30">
+            <title>WhatsApp Bot — Scan QR</title>
+            <style>
+                body { font-family: Arial, sans-serif; display: flex; flex-direction: column;
+                       align-items: center; justify-content: center; height: 100vh;
+                       margin: 0; background: #f0f2f5; }
+                .box { background: white; border-radius: 16px; padding: 40px;
+                       box-shadow: 0 4px 20px rgba(0,0,0,0.1); text-align: center; }
+                h2  { color: #128C7E; margin-bottom: 4px; }
+                img { margin: 20px 0; border: 4px solid #128C7E; border-radius: 12px; }
+                ol  { text-align: left; color: #444; line-height: 2; }
+                small { color: #999; }
+            </style>
+        </head>
+        <body>
+            <div class="box">
+                <h2>🤖 WhatsApp Stiker Bot</h2>
+                <p>Scan QR berikut dengan WhatsApp kamu</p>
+                <img src="${qrImage}" width="280" height="280" alt="QR Code"/>
+                <ol>
+                    <li>Buka WhatsApp di HP</li>
+                    <li>Ketuk <b>⋮ Menu → Perangkat Tertaut</b></li>
+                    <li>Ketuk <b>Tautkan Perangkat</b></li>
+                    <li>Arahkan kamera ke QR di atas</li>
+                </ol>
+                <small>QR refresh otomatis setiap 30 detik</small>
+            </div>
+        </body>
+        </html>
+    `);
+});
+
+server.listen(3000, () => {
+    console.log('🌐 Buka browser dan akses: http://localhost:3000');
+    console.log('📱 Scan QR Code yang tampil di browser untuk login\n');
+});
+
+// ── Reconnect & watchdog state ───────────────────────────────────────────────
+const RECONNECT_DELAY_MS = 10_000;  // jeda sebelum reconnect setelah disconnect
+const BOOT_TIMEOUT_MS    = 90_000;  // batas waktu start → QR/autentikasi
+const READY_TIMEOUT_MS   = 60_000;  // batas waktu authenticated → ready
+const MAX_RESTARTS       = 5;       // batas restart karena start/ready bermasalah
+let isBooting        = false;
+let isReady          = false;
+let restartAttempts  = 0;
+let bootWatchdog     = null;
+let readyWatchdog    = null;
+
+// ── Helper: tutup browser tanpa menghapus sesi login ─────────────────────────
+// destroy() milik LocalAuth hanya menutup browser; sesi di .wwebjs_auth tetap ada.
+async function safeDestroy() {
+    try {
+        await Promise.race([
+            client.destroy(),
+            new Promise((r) => setTimeout(r, 15_000)),
+        ]);
+    } catch (err) {
+        console.error('⚠️  destroy() gagal (diabaikan):', err?.message || err);
+    }
+}
+
+// ── Helper: watchdog start — restart kalau QR/autentikasi tak kunjung muncul ──
+function armBootWatchdog() {
+    clearTimeout(bootWatchdog);
+    bootWatchdog = setTimeout(() => {
+        if (isReady || latestQR) return;
+        console.error(`⏱️  Tidak ada QR/autentikasi dalam ${BOOT_TIMEOUT_MS / 1000} detik. Me-restart client...`);
+        restartClient('boot timeout');
+    }, BOOT_TIMEOUT_MS);
+}
+
+// ── Helper: start client dengan guard agar tidak terpicu ganda ────────────────
+function bootClient() {
+    if (isBooting) return;
+    isBooting = true;
+    Promise.resolve()
+        .then(() => client.initialize())
+        .catch((err) => console.error('❌ initialize gagal:', err?.message || err))
+        .finally(() => { isBooting = false; });
+}
+
+// ── Helper: restart terkontrol (dipakai watchdog) — sesi tetap tersimpan ──────
+async function restartClient(reason) {
+    if (isBooting) return;
+    if (restartAttempts >= MAX_RESTARTS) {
+        console.error(`🛑 Sudah ${MAX_RESTARTS}x restart tanpa berhasil (alasan terakhir: ${reason}). Hentikan percobaan otomatis — jalankan ulang node index.js secara manual.`);
+        return;
+    }
+    restartAttempts++;
+    isBooting = true;
+    try {
+        console.log(`♻️  Me-restart client (percobaan ${restartAttempts}/${MAX_RESTARTS}) — ${reason}...`);
+        await safeDestroy();
+        latestQR = null;
+        armBootWatchdog();
+        await client.initialize();
+        console.log('♻️  Restart selesai dijalankan.');
+    } catch (err) {
+        console.error('❌ Gagal restart:', err?.message || err);
+    } finally {
+        isBooting = false;
+    }
+}
+
+// ── Helper: reconnect setelah disconnect — tanpa batas percobaan ──────────────
+async function reconnectClient(reason) {
+    if (isBooting) return;
+    isBooting = true;
+    try {
+        console.log(`♻️  Menyambung ulang dalam ${RECONNECT_DELAY_MS / 1000} detik...`);
+        await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
+        await safeDestroy();
+        latestQR = null;
+        armBootWatchdog();
+        await client.initialize();
+        console.log('♻️  Reconnect selesai dijalankan.');
+    } catch (err) {
+        console.error('❌ Gagal reconnect:', err?.message || err);
+    } finally {
+        isBooting = false;
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  WHATSAPP CLIENT
+// ═════════════════════════════════════════════════════════════════════════════
+
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--disable-gpu'
+            // Catatan: jangan pakai --single-process / --no-zygote.
+            // Chrome modern (puppeteer 24) tidak mendukungnya dan menyebabkan
+            // error "Navigating frame was detached" saat client.initialize().
+        ],
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
+    }
+});
+
+client.on('qr', (qr) => {
+    latestQR = qr;
+    clearTimeout(bootWatchdog); // user sedang scan — jangan di-restart oleh watchdog
+    // Tetap tampilkan di terminal juga (sebagai cadangan)
+    console.log('\n📱 QR tersedia! Buka http://localhost:3000 di browser kamu\n');
+    qrcode.generate(qr, { small: true });
+});
+
+client.on('qr', (qr) => {
+    latestQR = qr;
+    clearTimeout(bootWatchdog); // user sedang scan — jangan di-restart oleh watchdog
+    // Tetap tampilkan di terminal juga (sebagai cadangan)
+    console.log('\n📱 QR tersedia! Buka http://localhost:3000 di browser kamu\n');
+    qrcode.generate(qr, { small: true });
+});
+
+client.on('ready', () => {
+    isReady = true;
+    restartAttempts = 0;
+    clearTimeout(bootWatchdog);
+    clearTimeout(readyWatchdog);
+    latestQR = null; // Hapus QR setelah berhasil login
+    console.log('\n✅ Bot WhatsApp Stiker siap digunakan!');
+    console.log('📌 Perintah: .s | .stiker nama|author | .brat teks | .help\n');
+});
+
+client.on('authenticated', () => {
+    console.log('🔐 Autentikasi berhasil!');
+    // Catatan: WA Web 2.3000.x kadang me-reload halaman tepat setelah sync,
+    // memutus rantai init internal wwebjs (ExposeStore → LoadUtils →
+    // attachEventListeners) sehingga event ready tidak pernah terpicu — tanpa
+    // error yang muncul di Node. Watchdog di bawah mendeteksi kondisi ini.
+    clearTimeout(bootWatchdog);
+    clearTimeout(readyWatchdog);
+    readyWatchdog = setTimeout(async () => {
+        if (isReady) return;
+        console.error(`⏱️  Ready tidak terpicu ${READY_TIMEOUT_MS / 1000} detik setelah autentikasi...`);
+        await restartClient('ready timeout');
+    }, READY_TIMEOUT_MS);
+});
+
+client.on('auth_failure',  (msg) => console.error('❌ Autentikasi gagal:', msg));
+client.on('error',         (err)  => console.error('❌ Client error:', err?.message || err));
+
+client.on('disconnected', async (reason) => {
+    console.log('🔌 Bot terputus:', reason);
+    isReady = false;
+    clearTimeout(readyWatchdog);
+    // Reconnect otomatis — jangan biarkan bot mati diam-diam.
+    await reconnectClient(reason);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  MESSAGE HANDLER
+// ═════════════════════════════════════════════════════════════════════════════
+
+client.on('message', async (msg) => {
+    try {
+        const cmd = parseCommand(msg.body);
+        if (!cmd) return;
+
+        switch (cmd.type) {
+            case 'help':
+                await sendHelp(msg); return;
+            case 'sticker':
+                await handleSticker(msg, cmd.name, cmd.author); return;
+            case 'brat':
+                await handleBrat(msg, cmd.text); return;
+        }
+
+    } catch (err) {
+        console.error('❌ Error memproses pesan:', err.message);
+    }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  HANDLER: STIKER
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function handleSticker(msg, stickerName, stickerAuthor) {
+    let mediaMsg = null;
+
+    if (msg.hasMedia && (msg.type === 'image' || msg.type === 'sticker')) {
+        mediaMsg = msg;
+    } else if (msg.hasQuotedMsg) {
+        const quoted = await msg.getQuotedMessage();
+        if (quoted.hasMedia && (quoted.type === 'image' || quoted.type === 'sticker')) {
+            mediaMsg = quoted;
+        }
+    }
+
+    if (!mediaMsg) {
+        await msg.reply(
+            '⚠️ *Tidak ada gambar ditemukan!*\n\n' +
+            'Kirim gambar dengan caption perintah, atau reply gambar dengan perintah.'
+        );
+        return;
+    }
+
+    try {
+        await msg.reply('⏳ Sedang membuat stiker...');
+
+        const media        = await mediaMsg.downloadMedia();
+        const inputBuffer  = Buffer.from(media.data, 'base64');
+        const outputBuffer = await sharp(inputBuffer)
+            .resize(512, 512, {
+                fit: 'contain',
+                background: { r: 0, g: 0, b: 0, alpha: 0 }
+            })
+            .webp({ quality: 80 })
+            .toBuffer();
+
+        const stickerMedia = new MessageMedia(
+            'image/webp',
+            outputBuffer.toString('base64'),
+            'sticker.webp'
+        );
+
+        await msg.reply(stickerMedia, null, {
+            sendMediaAsSticker: true,
+            stickerName:   stickerName,
+            stickerAuthor: stickerAuthor,
+        });
+
+        console.log(`✅ Stiker "${stickerName}" by "${stickerAuthor}" → ${msg.from}`);
+
+    } catch (err) {
+        console.error('❌ Gagal membuat stiker:', err.message);
+        await msg.reply('❌ Gagal membuat stiker. Pastikan file adalah gambar yang valid (JPG/PNG/WEBP).');
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  HANDLER: BRAT
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function handleBrat(msg, text) {
+    if (!text) {
+        await msg.reply(
+            '⚠️ *Teks tidak boleh kosong!*\n\n' +
+            'Contoh: `.brat charli xcx`'
+        );
+        return;
+    }
+
+    try {
+        await msg.reply('⏳ Sedang membuat stiker brat...');
+
+        // 1. Generate gambar brat (PNG) pakai canvas
+        const pngBuffer = await generateBratImage(text);
+
+        // 2. Convert PNG → WebP 512x512 pakai sharp (supaya jadi stiker WA)
+        const webpBuffer = await sharp(pngBuffer)
+            .resize(512, 512, {
+                fit: 'contain',
+                background: { r: 255, g: 255, b: 255, alpha: 1 } // warna putih
+            })
+            .webp({ quality: 90 })
+            .toBuffer();
+
+        const stickerMedia = new MessageMedia(
+            'image/webp',
+            webpBuffer.toString('base64'),
+            'brat.webp'
+        );
+
+        await msg.reply(stickerMedia, null, {
+            sendMediaAsSticker: true,
+            stickerName:   'brat',
+            stickerAuthor: DEFAULT_STICKER_AUTHOR,
+        });
+
+        console.log(`✅ Stiker brat "${text}" → ${msg.from}`);
+
+    } catch (err) {
+        console.error('❌ Gagal membuat stiker brat:', err.message);
+        await msg.reply('❌ Gagal membuat stiker brat. Coba lagi ya!');
+    }
+}
+
+// ── Generate gambar brat style ─────────────────────────────────────────────
+
+function generateBratImage(text) {
+    const SIZE = 512;
+    const canvas = createCanvas(SIZE, SIZE);
+    const ctx = canvas.getContext('2d');
+
+    // Background hijau brat
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, SIZE, SIZE);
+
+    // Teks selalu lowercase
+    const bratText = text.toLowerCase();
+
+    // Hitung font size adaptif berdasarkan panjang teks
+    let fontSize = Math.max(40, Math.min(120, Math.floor(480 / Math.max(bratText.length, 4))));
+
+    ctx.fillStyle = '#000000';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // Efek blur khas brat
+    ctx.filter = 'blur(1.5px)';
+    ctx.font = `bold ${fontSize}px Arial`;
+
+    // Wrap teks supaya muat
+    const lines = wrapText(ctx, bratText, SIZE - 60, fontSize);
+    const lineHeight = fontSize * 1.25;
+    const totalHeight = lines.length * lineHeight;
+    let startY = (SIZE - totalHeight) / 2 + lineHeight / 2;
+
+    for (const line of lines) {
+        ctx.fillText(line, SIZE / 2, startY);
+        startY += lineHeight;
+    }
+
+    return canvas.encode('png');
+}
+
+function wrapText(ctx, text, maxWidth, fontSize) {
+    // Kalau teks pendek, langsung return 1 baris
+    if (ctx.measureText(text).width <= maxWidth) return [text];
+
+    const words = text.split(' ');
+    const lines = [];
+    let currentLine = '';
+
+    for (const word of words) {
+        const testLine = currentLine ? `${currentLine} ${word}` : word;
+        if (ctx.measureText(testLine).width > maxWidth && currentLine) {
+            lines.push(currentLine);
+            currentLine = word;
+        } else {
+            currentLine = testLine;
+        }
+    }
+    if (currentLine) lines.push(currentLine);
+
+    return lines;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  HANDLER: HELP
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function sendHelp(msg) {
+    const helpText =
+        '╔══════════════════════════╗\n' +
+        '║   🤖  *BOT STIKER WA*    ║\n' +
+        '╚══════════════════════════╝\n\n' +
+
+        '📌 *PERINTAH TERSEDIA*\n' +
+        '─────────────────────────\n\n' +
+
+        '🖼️ *.s*\n' +
+        '  Konversi gambar jadi stiker\n' +
+        '  dengan nama & author default.\n\n' +
+
+        '🎨 *.stiker nama|author*\n' +
+        '  Konversi gambar jadi stiker\n' +
+        '  dengan nama & author custom.\n\n' +
+
+        '🟢 *.brat teks*\n' +
+        '  Buat stiker bergaya brat\n' +
+        '  (putih + teks blur ala Charli XCX).\n\n' +
+
+        '❓ *.help / .menu*\n' +
+        '  Tampilkan pesan bantuan ini.\n\n' +
+
+        '─────────────────────────\n' +
+        '📖 *CARA PAKAI*\n\n' +
+
+        '1️⃣  Kirim gambar + caption *.s*\n' +
+        '2️⃣  Reply gambar dengan *.s*\n' +
+        '3️⃣  Kirim gambar + caption\n' +
+        '    _.stiker Nama Stiker|Nama Author_\n' +
+        '4️⃣  Ketik *.brat teks kamu* untuk stiker brat\n\n' +
+
+        '─────────────────────────\n' +
+        '💡 *CONTOH*\n\n' +
+        '• `.stiker Kucingku|BotKu`\n' +
+        '• `.stiker |BotKu`  _(nama default)_\n' +
+        '• `.stiker Kucingku|`  _(author default)_\n' +
+        '• `.brat charli xcx`\n' +
+        '• `.brat so what`\n\n' +
+
+        '_Format: JPG · PNG · WEBP_';
+
+    await msg.reply(helpText);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  START
+// ═════════════════════════════════════════════════════════════════════════════
+
+console.log('🚀 Memulai Bot WhatsApp Stiker...');
+armBootWatchdog();
+bootClient();
